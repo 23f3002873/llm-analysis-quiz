@@ -105,7 +105,6 @@ class QuizSolver:
         Extract <pre> JSON blocks or base64-encoded JSON.
         """
         try:
-            # Try any <pre> elements (not just the first)
             pres = await page.query_selector_all("pre")
             for pre in pres:
                 try:
@@ -129,30 +128,78 @@ class QuizSolver:
 
     async def _find_submit_url(self, page) -> Optional[str]:
         """
-        Robust submit-URL finder. Tries several heuristics, ordered:
-        1. look for explicit absolute URLs containing '/submit'
-        2. look for form[action]
-        3. look for data-submit attributes
-        4. look for JS fetch/XHR calls in inline scripts
-        5. fallback: any URL that contains '/submit'
-        Logs a small page snippet to help debugging.
+        Verbose submit-URL finder — logs many candidate sources to Render logs:
+          - first 2k page snippet
+          - base href
+          - anchors (first 200)
+          - forms' action attributes
+          - meta refresh tags
+          - script snippet (first 200k chars)
+        Then applies a set of regexes to find anything with '/submit'.
+        This is intentionally noisy for debugging; remove extra prints after we fix.
         """
         try:
             body = await page.content()
         except Exception:
             return None
 
-        # Log a short snippet to Render logs to help debugging
+        # Short page snippet for quick inspection
         try:
             snippet = body[:2000].replace("\n", " ").replace("\r", " ")
             print("PAGE_SNIPPET:", snippet)
         except Exception:
             pass
 
-        # 1) Safe regex for absolute submit URLs (hyphen placed at end)
+        # base href (if present)
         try:
-            pattern = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
-            m = re.search(pattern, body)
+            base = await page.eval_on_selector("base", "b => b ? b.href : null")
+            print("BASE_HREF:", base)
+        except Exception:
+            base = None
+
+        # collect anchors (hrefs)
+        try:
+            anchors = await page.eval_on_selector_all(
+                "a",
+                "els => els.map(e => e.href || e.getAttribute('href')).filter(Boolean).slice(0,200)"
+            )
+            print(f"ANCHORS ({len(anchors)} shown up to 200):", anchors[:200])
+        except Exception:
+            anchors = []
+
+        # collect forms' action attributes
+        try:
+            forms = await page.eval_on_selector_all(
+                "form",
+                "forms => forms.map(f => f.action || f.getAttribute('action')).filter(Boolean)"
+            )
+            print("FORMS:", forms)
+        except Exception:
+            forms = []
+
+        # meta refresh
+        try:
+            metas = await page.eval_on_selector_all(
+                "meta[http-equiv='refresh'], meta[http-equiv='Refresh']",
+                "els => els.map(e => e.getAttribute('content')).filter(Boolean)"
+            )
+            print("META_REFRESH:", metas)
+        except Exception:
+            metas = []
+
+        # Inline scripts snippet for search
+        try:
+            scripts = await page.eval_on_selector_all("script", "scripts => scripts.map(s => s.innerText).filter(Boolean)")
+            joined = " ".join(scripts)[:200000]
+            print("SCRIPT_SNIPPET_LEN:", len(joined))
+        except Exception:
+            joined = ""
+
+        # Candidate search patterns (safe hyphen placement)
+        try:
+            # absolute urls
+            pattern1 = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
+            m = re.search(pattern1, body)
             if m:
                 url = m.group(0)
                 print("FOUND submit URL (pattern1):", url)
@@ -160,42 +207,30 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 2) Look for <form action="...">
-        try:
-            # run in page context to get forms' actions resolved to absolute URLs if present
-            actions = await page.eval_on_selector_all(
-                "form",
-                "forms => forms.map(f => f.action || f.getAttribute('action'))"
-            )
-            for a in actions:
-                if a and "/submit" in a:
-                    print("FOUND submit URL (form):", a)
+        # check anchors and forms for '/submit'
+        for a in anchors:
+            try:
+                if "/submit" in (a or ""):
+                    print("FOUND submit URL (anchor):", a)
                     return a
-        except Exception:
-            pass
+            except Exception:
+                continue
 
-        # 3) data-submit attribute on any element
-        try:
-            el = await page.query_selector("[data-submit]")
-            if el:
-                attr = await el.get_attribute("data-submit")
-                if attr:
-                    print("FOUND submit URL (data-submit):", attr)
-                    return attr
-        except Exception:
-            pass
+        for f in forms:
+            try:
+                if "/submit" in (f or ""):
+                    print("FOUND submit URL (form-list):", f)
+                    return f
+            except Exception:
+                continue
 
-        # 4) Inline scripts: look for fetch/post URLs or JSON payloads with submit keys
+        # check scripts
         try:
-            scripts = await page.eval_on_selector_all("script", "scripts => scripts.map(s => s.innerText).filter(Boolean)")
-            joined = " ".join(scripts)[:200000]  # cap size
-            # look for fetch('https://.../submit' or fetch("https://.../submit")
             m2 = re.search(r"fetch\(['\"](https?://[^'\"\)]+/submit[^'\"\)]*)['\"]", joined)
             if m2:
                 url = m2.group(1)
-                print("FOUND submit URL (fetch):", url)
+                print("FOUND submit URL (fetch in script):", url)
                 return url
-            # fallback: any https url in scripts containing /submit
             m3 = re.search(r"https?://[^'\"\s]+/submit[^'\"\s]*", joined)
             if m3:
                 url = m3.group(0)
@@ -204,7 +239,16 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 5) Looser fallback: any absolute or relative URL with '/submit' in body
+        # meta refresh containing a URL with /submit
+        for m in metas:
+            try:
+                if "/submit" in m:
+                    print("FOUND submit URL (meta-refresh):", m)
+                    return m
+            except Exception:
+                continue
+
+        # last-resort regex on the whole body (looser)
         try:
             m4 = re.search(r"(https?://[^\s'\"<>]+/submit[^\s'\"<>]*)", body)
             if m4:
@@ -221,8 +265,8 @@ class QuizSolver:
                     if rel.startswith("/"):
                         abs_url = origin + rel
                     else:
-                        base = await page.evaluate("() => location.href")
-                        abs_url = base.rsplit("/", 1)[0] + "/" + rel
+                        base_href = await page.evaluate("() => location.href")
+                        abs_url = base_href.rsplit("/", 1)[0] + "/" + rel
                     print("FOUND submit URL (fallback2 resolved):", abs_url)
                     return abs_url
                 except Exception:
@@ -231,6 +275,7 @@ class QuizSolver:
         except Exception:
             pass
 
+        print("FOUND submit URL: None")
         return None
 
     async def _solve_from_json_blob(self, blob: dict, page):
