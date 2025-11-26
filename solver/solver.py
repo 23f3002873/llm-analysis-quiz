@@ -51,7 +51,10 @@ class QuizSolver:
 
                 # If still no answer, try heuristic extraction from visible text
                 if answer is None:
-                    visible_text = await page.inner_text("body")
+                    try:
+                        visible_text = await page.inner_text("body")
+                    except Exception:
+                        visible_text = ""
                     answer = await self._heuristic_solve_text(visible_text, page)
 
                 # Resolve submit URL if still missing
@@ -102,9 +105,13 @@ class QuizSolver:
         Extract <pre> JSON blocks or base64-encoded JSON.
         """
         try:
-            pre = await page.query_selector("pre")
-            if pre:
-                text = await pre.inner_text()
+            # Try any <pre> elements (not just the first)
+            pres = await page.query_selector_all("pre")
+            for pre in pres:
+                try:
+                    text = await pre.inner_text()
+                except Exception:
+                    continue
                 # Try direct JSON
                 try:
                     return json.loads(text)
@@ -114,7 +121,7 @@ class QuizSolver:
                         decoded = base64.b64decode(text).decode("utf-8")
                         return json.loads(decoded)
                     except Exception:
-                        return None
+                        continue
         except Exception:
             return None
 
@@ -122,34 +129,105 @@ class QuizSolver:
 
     async def _find_submit_url(self, page) -> Optional[str]:
         """
-        Look for URLs ending in /submit or containing /submit in HTML.
-        Uses a safe character class where '-' is escaped/placed safely.
+        Robust submit-URL finder. Tries several heuristics, ordered:
+        1. look for explicit absolute URLs containing '/submit'
+        2. look for form[action]
+        3. look for data-submit attributes
+        4. look for JS fetch/XHR calls in inline scripts
+        5. fallback: any URL that contains '/submit'
+        Logs a small page snippet to help debugging.
         """
         try:
             body = await page.content()
         except Exception:
             return None
 
-        # safe regex: place hyphen at the end of the class (or escape it)
-        pattern = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
+        # Log a short snippet to Render logs to help debugging
         try:
+            snippet = body[:2000].replace("\n", " ").replace("\r", " ")
+            print("PAGE_SNIPPET:", snippet)
+        except Exception:
+            pass
+
+        # 1) Safe regex for absolute submit URLs (hyphen placed at end)
+        try:
+            pattern = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
             m = re.search(pattern, body)
             if m:
-                return m.group(0)
-        except re.error:
-            # fallback: try a looser search (avoid character classes)
-            try:
-                m2 = re.search(r"https?://\S+/submit\S*", body)
-                if m2:
-                    return m2.group(0)
-            except Exception:
-                return None
+                url = m.group(0)
+                print("FOUND submit URL (pattern1):", url)
+                return url
+        except Exception:
+            pass
 
-        # Try data-submit attr
+        # 2) Look for <form action="...">
         try:
-            element = await page.query_selector("[data-submit]")
-            if element:
-                return await element.get_attribute("data-submit")
+            # run in page context to get forms' actions resolved to absolute URLs if present
+            actions = await page.eval_on_selector_all(
+                "form",
+                "forms => forms.map(f => f.action || f.getAttribute('action'))"
+            )
+            for a in actions:
+                if a and "/submit" in a:
+                    print("FOUND submit URL (form):", a)
+                    return a
+        except Exception:
+            pass
+
+        # 3) data-submit attribute on any element
+        try:
+            el = await page.query_selector("[data-submit]")
+            if el:
+                attr = await el.get_attribute("data-submit")
+                if attr:
+                    print("FOUND submit URL (data-submit):", attr)
+                    return attr
+        except Exception:
+            pass
+
+        # 4) Inline scripts: look for fetch/post URLs or JSON payloads with submit keys
+        try:
+            scripts = await page.eval_on_selector_all("script", "scripts => scripts.map(s => s.innerText).filter(Boolean)")
+            joined = " ".join(scripts)[:200000]  # cap size
+            # look for fetch('https://.../submit' or fetch("https://.../submit")
+            m2 = re.search(r"fetch\(['\"](https?://[^'\"\)]+/submit[^'\"\)]*)['\"]", joined)
+            if m2:
+                url = m2.group(1)
+                print("FOUND submit URL (fetch):", url)
+                return url
+            # fallback: any https url in scripts containing /submit
+            m3 = re.search(r"https?://[^'\"\s]+/submit[^'\"\s]*", joined)
+            if m3:
+                url = m3.group(0)
+                print("FOUND submit URL (script-any):", url)
+                return url
+        except Exception:
+            pass
+
+        # 5) Looser fallback: any absolute or relative URL with '/submit' in body
+        try:
+            m4 = re.search(r"(https?://[^\s'\"<>]+/submit[^\s'\"<>]*)", body)
+            if m4:
+                url = m4.group(1)
+                print("FOUND submit URL (fallback1):", url)
+                return url
+            # relative URL: find action="/submit" or '/submit' fragments and resolve
+            m5 = re.search(r"action=['\"]([^'\"\"]*?/submit[^'\"\"]*)['\"]", body)
+            if m5:
+                rel = m5.group(1)
+                # try to compute absolute by using the page's URL
+                try:
+                    origin = await page.evaluate("() => location.origin")
+                    if rel.startswith("/"):
+                        abs_url = origin + rel
+                    else:
+                        base = await page.evaluate("() => location.href")
+                        abs_url = base.rsplit("/", 1)[0] + "/" + rel
+                    print("FOUND submit URL (fallback2 resolved):", abs_url)
+                    return abs_url
+                except Exception:
+                    print("FOUND submit URL (fallback2 raw):", rel)
+                    return rel
         except Exception:
             pass
 
@@ -184,7 +262,10 @@ class QuizSolver:
 
         if "sum of the" in text.lower() and "value" in text.lower():
             # Try finding a PDF link
-            links = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
+            try:
+                links = await page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
+            except Exception:
+                links = []
             for link in links:
                 if link and link.lower().endswith(".pdf"):
                     local_path = await self._download_file(link)
