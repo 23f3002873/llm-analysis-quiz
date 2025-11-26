@@ -7,20 +7,24 @@ from solver.solver import QuizSolver
 app = FastAPI(title="LLM Analysis Quiz Endpoint")
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
 @app.post("/quiz")
 async def quiz_endpoint(req: Request):
     """
-    Main quiz handler with DEBUG WRAPPER — returns traceback when an exception occurs.
-    REMOVE the debug wrapper once debugging is complete.
+    Production quiz handler — validates input, verifies secret,
+    runs the solver, and returns the solver result.
     """
-
-    # Try parse JSON
+    # Parse JSON
     try:
         payload = await req.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Validate fields
+    # Validate required fields
     if not all(k in payload for k in ("email", "secret", "url")):
         raise HTTPException(status_code=400, detail="Missing fields")
 
@@ -32,31 +36,19 @@ async def quiz_endpoint(req: Request):
     if secret != settings.SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # DEBUG WRAPPER: return errors with traceback instead of silent 500
+    # Run solver
+    solver = QuizSolver(
+        email=email,
+        secret=secret,
+        start_url=url,
+        timeout=settings.TIMEOUT_SECONDS
+    )
+
     try:
-        solver = QuizSolver(
-            email=email,
-            secret=secret,
-            start_url=url,
-            timeout=settings.TIMEOUT_SECONDS
-        )
-
         result = await solver.run()
-        return JSONResponse(status_code=200, content=result)
-
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
+        # Logable by Render, but return a generic 500 message
+        # (Render logs will still show the exception trace if present)
+        raise HTTPException(status_code=500, detail="Solver failed to run")
 
-        # Return detailed debug information (TEMPORARY — REMOVE LATER)
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": str(e),
-                "payload_sample": {
-                    "email": email,
-                    "url": url
-                },
-                "traceback": tb
-            }
-        )
+    return JSONResponse(status_code=200, content=result)
