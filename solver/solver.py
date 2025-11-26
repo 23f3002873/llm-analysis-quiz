@@ -34,20 +34,16 @@ class QuizSolver:
                 page = await context.new_page()
                 await page.goto(next_url, wait_until="networkidle")
 
-                # Try common sources of instructions
                 json_blob = await self._find_json_in_page(page)
 
                 answer = None
                 submit_url = None
 
-                # Find submit URL
                 submit_url = await self._find_submit_url(page)
 
-                # Attempt to get answer from JSON blob
                 if json_blob:
                     answer = await self._solve_from_json_blob(json_blob, page)
 
-                # Fallback heuristics
                 if answer is None:
                     try:
                         visible_text = await page.inner_text("body")
@@ -55,11 +51,9 @@ class QuizSolver:
                         visible_text = ""
                     answer = await self._heuristic_solve_text(visible_text, page)
 
-                # Re-check submit_url if still missing
                 if submit_url is None:
                     submit_url = await self._find_submit_url(page)
 
-                # Submit if we have both
                 if submit_url and answer is not None:
                     payload = {
                         "email": self.email,
@@ -68,6 +62,9 @@ class QuizSolver:
                         "answer": answer,
                     }
 
+                    # Diagnostic log of what we're about to send
+                    print("SUBMIT_PAYLOAD:", payload)
+
                     try:
                         resp = await self.client.post(submit_url, json=payload)
                         resp.raise_for_status()
@@ -75,6 +72,7 @@ class QuizSolver:
                         last_response = parsed
                         next_url = parsed.get("url")
                     except Exception as e:
+                        print("Submission failed:", e)
                         last_response = {"correct": False, "reason": str(e)}
                         break
                 else:
@@ -100,27 +98,23 @@ class QuizSolver:
                 except Exception:
                     continue
 
-                # direct JSON
                 try:
                     return json.loads(text)
                 except Exception:
                     pass
 
-                # strip tags then try JSON
                 try:
                     cleaned = re.sub(r"<[^>]+>", "", text).strip()
                     return json.loads(cleaned)
                 except Exception:
                     pass
 
-                # base64 decode attempt
                 try:
                     decoded = base64.b64decode(text).decode("utf-8")
                     return json.loads(decoded)
                 except Exception:
                     pass
 
-                # try to extract answer field from text
                 m = re.search(r'"answer"\s*:\s*"([^"]*)"', text)
                 if m:
                     return {"answer": m.group(1)}
@@ -138,7 +132,6 @@ class QuizSolver:
         except Exception:
             return None
 
-        # 1) absolute URL pattern
         try:
             pattern = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
             m = re.search(pattern, body)
@@ -147,7 +140,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 2) forms
         try:
             actions = await page.eval_on_selector_all(
                 "form",
@@ -159,7 +151,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 3) data-submit attribute
         try:
             element = await page.query_selector("[data-submit]")
             if element:
@@ -169,7 +160,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 4) anchors
         try:
             anchors = await page.eval_on_selector_all(
                 "a",
@@ -181,7 +171,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 5) inline scripts (fetch)
         try:
             scripts = await page.eval_on_selector_all("script", "scripts => scripts.map(s => s.innerText).filter(Boolean)")
             joined = " ".join(scripts)[:200000]
@@ -194,7 +183,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 6) dynamic origin markers (span.origin)
         try:
             has_origin = await page.eval_on_selector("span.origin", "s => !!s")
             if has_origin:
@@ -208,7 +196,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 7) meta refresh
         try:
             metas = await page.eval_on_selector_all("meta[http-equiv='refresh'], meta[http-equiv='Refresh']", "els => els.map(e => e.getAttribute('content')).filter(Boolean)")
             for m in metas:
@@ -217,7 +204,6 @@ class QuizSolver:
         except Exception:
             pass
 
-        # 8) fallback
         try:
             m4 = re.search(r"(https?://[^\s'\"<>]+/submit[^\s'\"<>]*)", body)
             if m4:
@@ -287,32 +273,73 @@ class QuizSolver:
                 f.write(r.content)
             return path
         except Exception as e:
+            print("Download failed", e)
             return None
 
     async def _sum_pdf_table_column(self, pdf_path: str, page_number: int = 2, column_name: str = "value"):
+        """
+        Extracts a table from PDF page and sums a column.
+        Prints diagnostic info (columns, head, cleaned column sample, total) to logs.
+        """
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 page_index = page_number - 1
+
                 if 0 <= page_index < len(pdf.pages):
                     page = pdf.pages[page_index]
                     table = page.extract_table()
+
                     if table:
                         df = pd.DataFrame(table[1:], columns=table[0])
-                        matches = [c for c in df.columns if c.lower() == column_name]
+
+                        # Diagnostic logs
+                        try:
+                            print("PDF_TABLE_COLUMNS:", [c for c in df.columns])
+                            print("PDF_TABLE_HEAD:", df.head(5).to_dict())
+                        except Exception:
+                            pass
+
+                        # strip whitespace from column names
+                        df.columns = [c.strip() for c in df.columns]
+
+                        # Case-insensitive match (compare lowered names)
+                        matches = [c for c in df.columns if c.lower() == column_name.lower()]
                         if matches:
                             col = matches[0]
-                            df[col] = pd.to_numeric(
-                                df[col].str.replace(r'[^0-9.\-]', '', regex=True),
-                                errors="coerce",
-                            )
-                            return int(df[col].sum(skipna=True))
+                            # Clean numeric text
+                            cleaned = df[col].astype(str).str.replace(r"[^0-9.\-]", "", regex=True)
+                            # Diagnostic sample of cleaned values
+                            try:
+                                print("PDF_CLEANED_COLUMN_SAMPLE:", cleaned.head(10).tolist())
+                            except Exception:
+                                pass
+                            df[col] = pd.to_numeric(cleaned, errors="coerce")
+                            total = df[col].sum(skipna=True)
+                            # Diagnostic total
+                            print("COMPUTED_TOTAL:", total, "type:", type(total).__name__)
+                            if pd.isna(total):
+                                return None
+                            if abs(total - round(total)) < 1e-4:
+                                return int(round(total))
+                            return float(total)
+
+                        # Fallback: sum numeric columns
                         numeric = df.apply(
                             lambda s: pd.to_numeric(
-                                s.str.replace(r'[^0-9.\-]', '', regex=True),
+                                s.astype(str).str.replace(r"[^0-9.\-]", "", regex=True),
                                 errors="coerce",
                             )
                         )
-                        return int(numeric.sum(axis=1).sum())
+                        row_sums = numeric.sum(axis=1, skipna=True)
+                        total = row_sums.sum(skipna=True)
+                        print("COMPUTED_TOTAL_FALLBACK:", total, "type:", type(total).__name__)
+                        if pd.isna(total):
+                            return None
+                        if abs(total - round(total)) < 1e-4:
+                            return int(round(total))
+                        return float(total)
+
             return None
-        except Exception:
+        except Exception as e:
+            print("PDF parsing failed", e)
             return None
