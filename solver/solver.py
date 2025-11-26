@@ -36,13 +36,13 @@ class QuizSolver:
                 page = await context.new_page()
                 await page.goto(next_url, wait_until="networkidle")
 
-                # Extract possible quiz instructions
+                # Extract possible quiz instructions (may return {'answer': ...})
                 json_blob = await self._find_json_in_page(page)
 
                 answer = None
                 submit_url = None
 
-                # Try finding submit URL
+                # Try finding submit URL (robust)
                 submit_url = await self._find_submit_url(page)
 
                 # If JSON blob exists, try solving from it
@@ -57,7 +57,7 @@ class QuizSolver:
                         visible_text = ""
                     answer = await self._heuristic_solve_text(visible_text, page)
 
-                # Resolve submit URL if still missing
+                # If still no submit_url but page uses dynamic origin spans, try again after JS ran
                 if submit_url is None:
                     submit_url = await self._find_submit_url(page)
 
@@ -78,7 +78,7 @@ class QuizSolver:
                         parsed = resp.json()
                         last_response = parsed
 
-                        # Move to next URL
+                        # Move to next URL (if provided)
                         next_url = parsed.get("url")
 
                     except Exception as e:
@@ -102,7 +102,8 @@ class QuizSolver:
 
     async def _find_json_in_page(self, page) -> Optional[dict]:
         """
-        Extract <pre> JSON blocks or base64-encoded JSON.
+        Extract <pre> JSON blocks, base64-encoded JSON, or suggested answer text.
+        Returns a dict if something useful is found (e.g. {"answer":...} or parsed JSON).
         """
         try:
             pres = await page.query_selector_all("pre")
@@ -111,16 +112,38 @@ class QuizSolver:
                     text = await pre.inner_text()
                 except Exception:
                     continue
+
                 # Try direct JSON
                 try:
                     return json.loads(text)
                 except Exception:
-                    # Try base64
-                    try:
-                        decoded = base64.b64decode(text).decode("utf-8")
-                        return json.loads(decoded)
-                    except Exception:
-                        continue
+                    pass
+
+                # Try to strip HTML tags (in case <span> placeholders remain) and parse JSON
+                try:
+                    cleaned = re.sub(r"<[^>]+>", "", text)
+                    cleaned = cleaned.strip()
+                    return json.loads(cleaned)
+                except Exception:
+                    pass
+
+                # Try base64 decode if the <pre> is base64
+                try:
+                    decoded = base64.b64decode(text).decode("utf-8")
+                    return json.loads(decoded)
+                except Exception:
+                    pass
+
+                # Try to extract a suggested answer using a simple regex:
+                m = re.search(r'"answer"\s*:\s*"([^"]*)"', text)
+                if m:
+                    return {"answer": m.group(1)}
+
+                # Try looser pattern: answer:\s*'...' or answer: ... (no quotes)
+                m2 = re.search(r'["\']?answer["\']?\s*[:=]\s*["\']?([^"\',\}\]]+)', text, flags=re.IGNORECASE)
+                if m2:
+                    return {"answer": m2.group(1).strip()}
+
         except Exception:
             return None
 
@@ -128,108 +151,85 @@ class QuizSolver:
 
     async def _find_submit_url(self, page) -> Optional[str]:
         """
-        Verbose submit-URL finder — logs many candidate sources to Render logs:
-          - first 2k page snippet
-          - base href
-          - anchors (first 200)
-          - forms' action attributes
-          - meta refresh tags
-          - script snippet (first 200k chars)
-        Then applies a set of regexes to find anything with '/submit'.
-        This is intentionally noisy for debugging; remove extra prints after we fix.
+        Robust submit-URL finder. Tries several heuristics and logs candidates:
+         - absolute URL patterns
+         - form[action]
+         - data-submit attribute
+         - JS fetch() URLs
+         - anchors list
+         - special handling for dynamic <span class="origin">...</span>
         """
         try:
             body = await page.content()
         except Exception:
             return None
 
-        # Short page snippet for quick inspection
+        # Short page snippet for quick inspection (Render logs)
         try:
             snippet = body[:2000].replace("\n", " ").replace("\r", " ")
             print("PAGE_SNIPPET:", snippet)
         except Exception:
             pass
 
-        # base href (if present)
+        # 1) Absolute URL pattern (safe placement of hyphen)
         try:
-            base = await page.eval_on_selector("base", "b => b ? b.href : null")
-            print("BASE_HREF:", base)
+            pattern = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
+            m = re.search(pattern, body)
+            if m:
+                url = m.group(0)
+                print("FOUND submit URL (pattern):", url)
+                return url
         except Exception:
-            base = None
+            pass
 
-        # collect anchors (hrefs)
+        # 2) Look for <form action="...">
+        try:
+            actions = await page.eval_on_selector_all(
+                "form",
+                "forms => forms.map(f => f.action || f.getAttribute('action')).filter(Boolean)"
+            )
+            print("FORMS:", actions)
+            for a in actions:
+                if a and "/submit" in a:
+                    print("FOUND submit URL (form):", a)
+                    return a
+        except Exception:
+            pass
+
+        # 3) data-submit attribute on any element
+        try:
+            element = await page.query_selector("[data-submit]")
+            if element:
+                attr = await element.get_attribute("data-submit")
+                if attr:
+                    print("FOUND submit URL (data-submit):", attr)
+                    return attr
+        except Exception:
+            pass
+
+        # 4) anchors (hrefs)
         try:
             anchors = await page.eval_on_selector_all(
                 "a",
                 "els => els.map(e => e.href || e.getAttribute('href')).filter(Boolean).slice(0,200)"
             )
             print(f"ANCHORS ({len(anchors)} shown up to 200):", anchors[:200])
+            for a in anchors:
+                if a and "/submit" in a:
+                    print("FOUND submit URL (anchor):", a)
+                    return a
         except Exception:
-            anchors = []
+            pass
 
-        # collect forms' action attributes
-        try:
-            forms = await page.eval_on_selector_all(
-                "form",
-                "forms => forms.map(f => f.action || f.getAttribute('action')).filter(Boolean)"
-            )
-            print("FORMS:", forms)
-        except Exception:
-            forms = []
-
-        # meta refresh
-        try:
-            metas = await page.eval_on_selector_all(
-                "meta[http-equiv='refresh'], meta[http-equiv='Refresh']",
-                "els => els.map(e => e.getAttribute('content')).filter(Boolean)"
-            )
-            print("META_REFRESH:", metas)
-        except Exception:
-            metas = []
-
-        # Inline scripts snippet for search
+        # 5) Inline scripts: look for fetch/post URLs or any https URL containing /submit
         try:
             scripts = await page.eval_on_selector_all("script", "scripts => scripts.map(s => s.innerText).filter(Boolean)")
             joined = " ".join(scripts)[:200000]
             print("SCRIPT_SNIPPET_LEN:", len(joined))
-        except Exception:
-            joined = ""
-
-        # Candidate search patterns (safe hyphen placement)
-        try:
-            # absolute urls
-            pattern1 = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
-            m = re.search(pattern1, body)
-            if m:
-                url = m.group(0)
-                print("FOUND submit URL (pattern1):", url)
-                return url
-        except Exception:
-            pass
-
-        # check anchors and forms for '/submit'
-        for a in anchors:
-            try:
-                if "/submit" in (a or ""):
-                    print("FOUND submit URL (anchor):", a)
-                    return a
-            except Exception:
-                continue
-
-        for f in forms:
-            try:
-                if "/submit" in (f or ""):
-                    print("FOUND submit URL (form-list):", f)
-                    return f
-            except Exception:
-                continue
-
-        # check scripts
-        try:
             m2 = re.search(r"fetch\(['\"](https?://[^'\"\)]+/submit[^'\"\)]*)['\"]", joined)
             if m2:
                 url = m2.group(1)
-                print("FOUND submit URL (fetch in script):", url)
+                print("FOUND submit URL (fetch):", url)
                 return url
             m3 = re.search(r"https?://[^'\"\s]+/submit[^'\"\s]*", joined)
             if m3:
@@ -239,39 +239,41 @@ class QuizSolver:
         except Exception:
             pass
 
-        # meta refresh containing a URL with /submit
-        for m in metas:
-            try:
-                if "/submit" in m:
+        # 6) Special handling: page uses dynamic <span class="origin"> that is filled by JS
+        #    If such a span exists in the DOM, compute origin via JS and return origin + '/submit'
+        try:
+            has_origin = await page.eval_on_selector("span.origin", "s => !!s")
+            if has_origin:
+                try:
+                    origin = await page.evaluate("() => (document.querySelector('span.origin') || {}).textContent || location.origin")
+                    if origin:
+                        origin = origin.rstrip("/")
+                        url = f"{origin}/submit"
+                        print("FOUND submit URL (dynamic origin):", url)
+                        return url
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 7) Meta refresh/other small heuristics
+        try:
+            metas = await page.eval_on_selector_all("meta[http-equiv='refresh'], meta[http-equiv='Refresh']", "els => els.map(e => e.getAttribute('content')).filter(Boolean)")
+            print("META_REFRESH:", metas)
+            for m in metas:
+                if "/submit" in (m or ""):
                     print("FOUND submit URL (meta-refresh):", m)
                     return m
-            except Exception:
-                continue
+        except Exception:
+            pass
 
-        # last-resort regex on the whole body (looser)
+        # 8) Looser regex fallback on whole body
         try:
             m4 = re.search(r"(https?://[^\s'\"<>]+/submit[^\s'\"<>]*)", body)
             if m4:
                 url = m4.group(1)
-                print("FOUND submit URL (fallback1):", url)
+                print("FOUND submit URL (fallback):", url)
                 return url
-            # relative URL: find action="/submit" or '/submit' fragments and resolve
-            m5 = re.search(r"action=['\"]([^'\"\"]*?/submit[^'\"\"]*)['\"]", body)
-            if m5:
-                rel = m5.group(1)
-                # try to compute absolute by using the page's URL
-                try:
-                    origin = await page.evaluate("() => location.origin")
-                    if rel.startswith("/"):
-                        abs_url = origin + rel
-                    else:
-                        base_href = await page.evaluate("() => location.href")
-                        abs_url = base_href.rsplit("/", 1)[0] + "/" + rel
-                    print("FOUND submit URL (fallback2 resolved):", abs_url)
-                    return abs_url
-                except Exception:
-                    print("FOUND submit URL (fallback2 raw):", rel)
-                    return rel
         except Exception:
             pass
 
@@ -281,21 +283,30 @@ class QuizSolver:
     async def _solve_from_json_blob(self, blob: dict, page):
         """
         Handle JSON instructions — PDF tasks, direct answers, etc.
+        If blob contains a file URL to download, handle that; if it contains an 'answer' key, return it.
         """
+        # If blob already contains answer
+        if isinstance(blob, dict) and "answer" in blob:
+            return blob["answer"]
 
         # Common pattern: blob contains URL to a file
-        download_url = blob.get("url") or blob.get("file")
-        if download_url:
-            local_path = await self._download_file(download_url)
+        if isinstance(blob, dict):
+            download_url = blob.get("url") or blob.get("file")
+            if download_url:
+                local_path = await self._download_file(download_url)
+                if local_path and local_path.lower().endswith(".pdf"):
+                    val = await self._sum_pdf_table_column(local_path)
+                    if val is not None:
+                        return val
 
-            if local_path and local_path.lower().endswith(".pdf"):
-                val = await self._sum_pdf_table_column(local_path)
-                if val is not None:
-                    return val
-
-        # If blob already contains answer
-        if "answer" in blob:
-            return blob["answer"]
+        # If blob is not a dict but some text, try to extract "answer" using regex
+        try:
+            text_blob = str(blob)
+            m = re.search(r'"answer"\s*:\s*"([^"]*)"', text_blob)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
 
         return None
 
@@ -304,6 +315,8 @@ class QuizSolver:
         Fallback heuristic for sample questions like:
         "What is the sum of the value column on page 2?"
         """
+        if not text:
+            return None
 
         if "sum of the" in text.lower() and "value" in text.lower():
             # Try finding a PDF link
@@ -317,6 +330,18 @@ class QuizSolver:
                     if local_path:
                         return await self._sum_pdf_table_column(local_path, page_number=2)
 
+        # As a last resort for demo pages that accept anything, try to extract suggested answer from <pre>
+        try:
+            pre = await page.query_selector("pre")
+            if pre:
+                text = await pre.inner_text()
+                m = re.search(r'"answer"\s*:\s*"([^"]*)"', text)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+
+        # No heuristic found
         return None
 
     async def _download_file(self, url: str) -> Optional[str]:
@@ -324,7 +349,7 @@ class QuizSolver:
             r = await self.client.get(url)
             r.raise_for_status()
 
-            suffix = os.path.splitext(url)[1]
+            suffix = os.path.splitext(url)[1] or ""
             fd, path = tempfile.mkstemp(suffix=suffix)
 
             with os.fdopen(fd, "wb") as f:
