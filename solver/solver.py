@@ -123,11 +123,27 @@ class QuizSolver:
     async def _find_submit_url(self, page) -> Optional[str]:
         """
         Look for URLs ending in /submit or containing /submit in HTML.
+        Uses a safe character class where '-' is escaped/placed safely.
         """
-        body = await page.content()
-        m = re.search(r"https?://[\\w\\-./:?=&]+/submit[\\w\\-./:?=&]*", body)
-        if m:
-            return m.group(0)
+        try:
+            body = await page.content()
+        except Exception:
+            return None
+
+        # safe regex: place hyphen at the end of the class (or escape it)
+        pattern = r"https?://[\w./:?=&\-]+/submit[\w./:?=&\-]*"
+        try:
+            m = re.search(pattern, body)
+            if m:
+                return m.group(0)
+        except re.error:
+            # fallback: try a looser search (avoid character classes)
+            try:
+                m2 = re.search(r"https?://\S+/submit\S*", body)
+                if m2:
+                    return m2.group(0)
+            except Exception:
+                return None
 
         # Try data-submit attr
         try:
