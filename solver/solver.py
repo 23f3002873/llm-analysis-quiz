@@ -214,7 +214,7 @@ class QuizSolver:
                         if matches:
                             col = matches[0]
                             df[col] = pd.to_numeric(
-                                df[col].str.replace("[^0-9.-]", "", regex=True),
+                                df[col].str.replace(r'[^0-9.\-]', '', regex=True),
                                 errors="coerce",
                             )
                             return int(df[col].sum(skipna=True))
@@ -222,7 +222,7 @@ class QuizSolver:
                         # Fallback: sum numeric columns
                         numeric = df.apply(
                             lambda s: pd.to_numeric(
-                                s.str.replace("[^0-9.-]", "", regex=True),
+                                s.str.replace(r'[^0-9.\-]', '', regex=True),
                                 errors="coerce",
                             )
                         )
